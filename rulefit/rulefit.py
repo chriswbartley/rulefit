@@ -297,8 +297,30 @@ class RuleFit(BaseEstimator, TransformerMixin):
 
     Parameters
     ----------
-        tree_generator: object GradientBoostingRegressor or GradientBoostingClassifier, optional (default=None)
-
+        n_feats:        The number of features
+        incr_feats:     A list or array of the monotone increasing features (1 based)
+        decr_feats:     A list or array of the monotone decreasing features (1 based)
+        tree_size:      Number of terminal nodes in generated trees. If exp_rand_tree_size=True, 
+                        this will be the mean number of terminal nodes.
+        sample_fract:   fraction of randomly chosen training observations used to produce each tree. 
+                        FP 2004 (Sec. 2)
+        max_rules:      approximate total number of rules generated for fitting. Note that actual
+                        number of rules will usually be lower than this due to duplicates.
+        memory_par:     scale multiplier (shrinkage factor) applied to each new tree when 
+                        sequentially induced. FP 2004 (Sec. 2)
+        rfmode:         'regress' for regression or 'classify' for binary classification.
+        lin_standardise: If True, the linear terms will be standardised as per Friedman Sec 3.2
+                        by multiplying the winsorised variable by 0.4/stdev.
+        lin_trim_quantile: If lin_standardise is True, this quantile will be used to trim linear 
+                        terms before standardisation.
+        exp_rand_tree_size: If True, each boosted tree will have a different maximum number of 
+                        terminal nodes based on an exponential distribution about tree_size. 
+                        (Friedman Sec 3.3)
+        model_type:     'r': rules only; 'l': linear terms only; 'rl': both rules and linear terms
+        random_state:   Integer to initialise random objects and provide repeatability.
+        tree_generator: Optional: this object will be used as provided to generate the rules. 
+                        This will override almost all the other properties above. 
+                        Must be GradientBoostingRegressor or GradientBoostingClassifier, optional (default=None)
     Attributes
     ----------
     rule_ensemble: RuleEnsemble
@@ -372,7 +394,6 @@ class RuleFit(BaseEstimator, TransformerMixin):
                     i=i+1
                 tree_sizes=tree_sizes[0:i]
                 self.tree_generator.set_params(warm_start=True) 
-    #            num_rules=0
                 for i_size in np.arange(len(tree_sizes)):
                     size=tree_sizes[i_size]
                     self.tree_generator.set_params(n_estimators=len(self.tree_generator.estimators_)+1)
@@ -381,12 +402,6 @@ class RuleFit(BaseEstimator, TransformerMixin):
                     self.tree_generator.get_params()['n_estimators']
                     self.tree_generator.fit(np.copy(X, order='C'), np.copy(y, order='C'))
                     # count leaves (a check)
-    #                tree_=self.tree_generator.estimators_[j_][0].tree_
-    #                test_=tree_.children_left+ tree_.children_left
-    #                num_leaves=len(test_[test_==-2])
-    #                num_rules=num_rules+mean_leaves
-    #            print('num rules: ' + str(num_rules))
-    #                print('tree_size: ' + str(size) + ' mean actual number of leaf nodes: ' + str(mean_leaves) + ' for ' + str(cnt)+ ' trees')
                 self.tree_generator.set_params(warm_start=False) 
             tree_list = self.tree_generator.estimators_
             if isinstance(self.tree_generator, RandomForestRegressor) or isinstance(self.tree_generator, RandomForestClassifier):
