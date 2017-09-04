@@ -12,8 +12,8 @@ X = boston_data.drop("medv", axis=1)
 features = X.columns
 X = X.as_matrix()
 
-typ='classifier'
-use_mt_feats=True
+typ='classifier' #classifier or regressor
+use_mt_feats=False
 
 if use_mt_feats:
     incr_feats=[6,9]
