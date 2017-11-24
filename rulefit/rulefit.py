@@ -16,11 +16,13 @@ from sklearn.base import BaseEstimator
 from sklearn.base import TransformerMixin
 from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier, RandomForestRegressor, RandomForestClassifier
 from sklearn.linear_model import LassoCV
+from sklearn.cross_validation import train_test_split,StratifiedKFold
 from functools import reduce
 import  scipy 
 import cvglmnet
 import cvglmnetCoef
 import cvglmnetPredict
+from monoboost import MonoBoost,MonoLearner,MonoBoostEnsemble
 
 class GLMCV():
     def __init__(self,family='gaussian',incr_feats=None,decr_feats=None):
@@ -45,6 +47,9 @@ class GLMCV():
         self.intercept_=coef[0,0]
     def predict(self,x):
         return cvglmnetPredict.cvglmnetPredict(self.cvfit, newx = x, s = 'lambda_min', ptype = 'class')
+
+    def predict_proba(self,x):
+        return cvglmnetPredict.cvglmnetPredict(self.cvfit, newx = x, s = 'lambda_min', ptype = 'link')
         
    
 
@@ -335,7 +340,11 @@ class RuleFit(BaseEstimator, TransformerMixin):
                  tree_generator=None,n_feats=None,incr_feats=[],decr_feats=[],
                 rfmode='regress',lin_trim_quantile=0.025,
                 lin_standardise=True, exp_rand_tree_size=True,
-                model_type='rl',random_state=None):
+                model_type='rl',random_state=None,instance_max_rules=500,
+                instance_rules_per_learner=15,instance_use_exp_rand=True, instance_v=[0.001,0.01,0.05,0.25,0.5],
+                instance_learner_type='one-sided',instance_learner_eta=1,
+                mt_feat_mode='specified',
+                auto_mt_feat_cv=5,auto_mt_feat_type='best'):
         self.tree_generator = tree_generator
         self.n_feats=n_feats
         self.incr_feats=np.asarray([] if incr_feats is None else incr_feats)
@@ -354,130 +363,195 @@ class RuleFit(BaseEstimator, TransformerMixin):
         self.tree_size=tree_size
         self.random_state=random_state
         self.model_type=model_type
-        
-    def fit(self, X, y=None, feature_names=None):
-        """Fit and estimate linear combination of rule ensemble
-
-        """
-        ## Enumerate features if feature names not provided
+        self.instance_max_rules=instance_max_rules
+        self.instance_rules_per_learner=instance_rules_per_learner
+        self.instance_use_exp_rand=instance_use_exp_rand
+        self.instance_v=instance_v
+        self.instance_learner_type=instance_learner_type
+        self.mt_feat_mode=mt_feat_mode
+        self.auto_mt_feat_cv=auto_mt_feat_cv
+        self.glmnet_family='gaussian' if self.rfmode=='regress' else 'binomial'
+        self.auto_mt_feat_type=auto_mt_feat_type
+        self.instance_learner_eta=instance_learner_eta
+    def load_rule_candidates(self,X,y):
         N=X.shape[0]
-        if feature_names is None:
-            self.feature_names = ['feature_' + str(x) for x in range(0, X.shape[1])]
-        else:
-            self.feature_names=feature_names
-        if 'r' in self.model_type:
-            ## initialise tree generator
-            if self.tree_generator is None:
-                n_estimators_default=int(np.ceil(self.max_rules/self.tree_size))
-                self.sample_fract_=min(0.5,(100+6*np.sqrt(N))/N)
-                if   self.rfmode=='regress':
-                    self.tree_generator = GradientBoostingRegressor(n_estimators=n_estimators_default, max_leaf_nodes=self.tree_size, learning_rate=self.memory_par,subsample=self.sample_fract_,random_state=self.random_state,max_depth=100)
-                else:
-                    self.tree_generator =GradientBoostingClassifier(n_estimators=n_estimators_default, max_leaf_nodes=self.tree_size, learning_rate=self.memory_par,subsample=self.sample_fract_,random_state=self.random_state,max_depth=100)
-    
+        ## initialise tree generator
+        if self.tree_generator is None:
+            n_estimators_default=int(np.ceil(self.max_rules/self.tree_size))
+            self.sample_fract_=min(0.5,(100+6*np.sqrt(N))/N) if self.sample_fract=='default' else self.sample_fract    
             if   self.rfmode=='regress':
-                if type(self.tree_generator) not in [GradientBoostingRegressor,RandomForestRegressor]:
-                    raise ValueError("RuleFit only works with RandomForest and BoostingRegressor")
+                self.tree_generator = GradientBoostingRegressor(n_estimators=n_estimators_default, max_leaf_nodes=self.tree_size, learning_rate=self.memory_par,subsample=self.sample_fract_,random_state=self.random_state,max_depth=100)
             else:
-                if type(self.tree_generator) not in [GradientBoostingClassifier,RandomForestClassifier]:
-                    raise ValueError("RuleFit only works with RandomForest and BoostingClassifier")
-    
-            ## fit tree generator
-            if not self.exp_rand_tree_size: # simply fit with constant tree size
-                self.tree_generator.fit(X, y)
-            else: # randomise tree size as per Friedman 2005 Sec 3.3
-                np.random.seed(self.random_state)
-                tree_sizes=np.random.exponential(scale=self.tree_size-2,size=int(np.ceil(self.max_rules*2/self.tree_size)))
-                tree_sizes=np.asarray([2+np.floor(tree_sizes[i_]) for i_ in np.arange(len(tree_sizes))],dtype=int)
-                i=int(len(tree_sizes)/4)
-                while np.sum(tree_sizes[0:i])<self.max_rules:
-                    i=i+1
-                tree_sizes=tree_sizes[0:i]
-                self.tree_generator.set_params(warm_start=True) 
-                for i_size in np.arange(len(tree_sizes)):
-                    size=tree_sizes[i_size]
-                    self.tree_generator.set_params(n_estimators=len(self.tree_generator.estimators_)+1)
-                    self.tree_generator.set_params(max_leaf_nodes=size)
-                    self.tree_generator.set_params(random_state=i_size+self.random_state) # warm_state=True seems to reset random_state, such that the trees are highly correlated, unless we manually change the random_sate here.
-                    self.tree_generator.get_params()['n_estimators']
-                    self.tree_generator.fit(np.copy(X, order='C'), np.copy(y, order='C'))
-                    # count leaves (a check)
-                self.tree_generator.set_params(warm_start=False) 
-            tree_list = self.tree_generator.estimators_
-            if isinstance(self.tree_generator, RandomForestRegressor) or isinstance(self.tree_generator, RandomForestClassifier):
-                 tree_list = [[x] for x in self.tree_generator.estimators_]
-                 
-            ## extract rules
-            self.rule_ensemble = RuleEnsemble(tree_list = tree_list,
-                                              feature_names=self.feature_names)
-            ## filter for upper and lower rules only (if needed)
-            self.num_rules_peak_=len(self.rule_ensemble.rules)
-            if len(self.mt_feats)>0: 
-                filtered_rules=set()
-                for rule in self.rule_ensemble.rules:
-                    conditions=list(rule.conditions)
-                    all_incr=np.all([conditions[c].operator[0]==('>' if conditions[c].feature_index in self.incr_feats-1 else '<') for c in [cc for cc in np.arange(len(conditions)) if conditions[cc].feature_index in self.mt_feats-1]])
-                    all_decr=np.all([conditions[c].operator[0]==('<' if conditions[c].feature_index in self.incr_feats-1 else '>') for c in [cc for cc in np.arange(len(conditions)) if conditions[cc].feature_index in self.mt_feats-1]])
-                    if (all_incr and rule.value>0) or (all_decr and rule.value<0):
-                        rule.rule_direction=+1 if all_incr else -1
-                        filtered_rules.add(rule)
-                #print('started with ' + str(len(self.rule_ensemble.rules)) + ' rules, now have ' + str(len(filtered_rules)))
-                self.rule_ensemble.rules=list(filtered_rules)
-            ## concatenate original features and rules
+                self.tree_generator =GradientBoostingClassifier(n_estimators=n_estimators_default, max_leaf_nodes=self.tree_size, learning_rate=self.memory_par,subsample=self.sample_fract_,random_state=self.random_state,max_depth=100)
+
+        if   self.rfmode=='regress':
+            if type(self.tree_generator) not in [GradientBoostingRegressor,RandomForestRegressor]:
+                raise ValueError("RuleFit only works with RandomForest and BoostingRegressor")
+        else:
+            if type(self.tree_generator) not in [GradientBoostingClassifier,RandomForestClassifier]:
+                raise ValueError("RuleFit only works with RandomForest and BoostingClassifier")
+
+        ## fit tree generator
+        if not self.exp_rand_tree_size: # simply fit with constant tree size
+            self.tree_generator.fit(X, y)
+        else: # randomise tree size as per Friedman 2005 Sec 3.3
+            np.random.seed(self.random_state)
+            tree_sizes=np.random.exponential(scale=self.tree_size-2,size=int(np.ceil(self.max_rules*2/self.tree_size)))
+            tree_sizes=np.asarray([2+np.floor(tree_sizes[i_]) for i_ in np.arange(len(tree_sizes))],dtype=int)
+            i=int(len(tree_sizes)/4)
+            while np.sum(tree_sizes[0:i])<self.max_rules:
+                i=i+1
+            tree_sizes=tree_sizes[0:i]
+            self.tree_generator.set_params(warm_start=True) 
+            for i_size in np.arange(len(tree_sizes)):
+                size=tree_sizes[i_size]
+                self.tree_generator.set_params(n_estimators=len(self.tree_generator.estimators_)+1)
+                self.tree_generator.set_params(max_leaf_nodes=size)
+                self.tree_generator.set_params(random_state=i_size+self.random_state) # warm_state=True seems to reset random_state, such that the trees are highly correlated, unless we manually change the random_sate here.
+                self.tree_generator.get_params()['n_estimators']
+                self.tree_generator.fit(np.copy(X, order='C'), np.copy(y, order='C'))
+                # count leaves (a check)
+            self.tree_generator.set_params(warm_start=False) 
+        tree_list = self.tree_generator.estimators_
+        if isinstance(self.tree_generator, RandomForestRegressor) or isinstance(self.tree_generator, RandomForestClassifier):
+             tree_list = [[x] for x in self.tree_generator.estimators_]
+             
+        ## extract rules
+        self.rule_ensemble = RuleEnsemble(tree_list = tree_list,
+                                          feature_names=self.feature_names)
+        return
+    def load_instance_rule_candidates(self,X,y):
+        N=X.shape[0]
+        ## initialise instance rule generator
+        self.sample_fract_=min(0.5,(100+6*np.sqrt(N))/N) if self.sample_fract=='default' else self.sample_fract    
+        default_instance_v=self.instance_v #[0.001,0.05,0.25,0.5,1.0]#np.mean(self.instance_v)
+        #self.instance_ensemble=MonoBoost(n_feats=self.n_feats,incr_feats=self.incr_feats,decr_feats=self.decr_feats,num_estimators=self.instance_max_rules,fit_algo='L2-one-class',eta=self.memory_par,vs=default_instance_v,verbose=False,hp_reg=None ,hp_reg_c=None ,learner_type='one-sided',v_random=True,hp_recalc_freq=self.instance_rules_per_learner,random_state=self.random_state)
+        self.instance_ensemble=MonoBoostEnsemble(n_feats=self.n_feats,incr_feats=self.incr_feats,decr_feats=self.decr_feats,num_estimators=self.instance_max_rules,fit_algo='L2-one-class',eta=self.memory_par,vs=default_instance_v,verbose=False ,learner_type=self.instance_learner_type,learner_num_estimators=self.instance_rules_per_learner,learner_eta=self.instance_learner_eta, learner_v_mode='random',sample_fract =self.sample_fract_,random_state=self.random_state,standardise=True)
+        self.instance_ensemble.fit(X, y)
+        return 
+    def get_mt_compliant_rule_ensemble(self,rule_ensemble,incr_feats,decr_feats):
+        ## filter for upper and lower rules only (if needed)
+        incr_feats=np.asarray(incr_feats)
+        decr_feats=np.asarray(decr_feats)
+        mt_feats=np.asarray(list(incr_feats)+list(decr_feats))
+        filtered_rules=[]
+        filtered_rules_indxs=[]
+        i_rule=0
+        for rule in rule_ensemble.rules:
+            conditions=list(rule.conditions)
+            all_incr=np.all([conditions[c].operator[0]==('>' if conditions[c].feature_index in incr_feats-1 else '<') for c in [cc for cc in np.arange(len(conditions)) if conditions[cc].feature_index in mt_feats-1]])
+            all_decr=np.all([conditions[c].operator[0]==('<' if conditions[c].feature_index in incr_feats-1 else '>') for c in [cc for cc in np.arange(len(conditions)) if conditions[cc].feature_index in mt_feats-1]])
+            if all_incr and all_decr: # no monotone features must be used in this rule!
+                rule.rule_direction=0
+                filtered_rules=filtered_rules+[rule] 
+                filtered_rules_indxs=filtered_rules_indxs+[i_rule]
+            if (all_incr and rule.value>0) or (all_decr and rule.value<0):
+                rule.rule_direction=+1 if all_incr else -1
+                filtered_rules=filtered_rules+[rule] 
+                filtered_rules_indxs=filtered_rules_indxs+[i_rule]
+            i_rule=i_rule+1
+        #print('started with ' + str(len(self.rule_ensemble.rules)) + ' rules, now have ' + str(len(filtered_rules)))
+        re=RuleEnsemble(tree_list=rule_ensemble.tree_list,feature_names=rule_ensemble.feature_names)
+        re.rules=list(filtered_rules)
+        return [re,filtered_rules_indxs]
+    def get_lin_feats(self,X):
+        if self.lin_standardise:
+            self.friedscale.train(X)
+            X_regn=self.friedscale.scale(X)
+        else:
+            X_regn=X.copy() 
+        return X_regn
+    def get_candidate_features(self,X):
+        N=X.shape[0]
+        if 'r' in self.model_type:
             X_rules = self.rule_ensemble.transform(X)
-        
-        ## standardise linear variables if requested (for regression model only)
+        if 'i' in self.model_type: 
+            X_instance = self.instance_ensemble.transform(X)
         if 'l' in self.model_type: 
-            if self.lin_standardise:
-                self.friedscale.train(X)
-                X_regn=self.friedscale.scale(X)
-            else:
-                X_regn=X.copy()            
+            X_regn=self.get_lin_feats(X)
+           
         
         ## Compile Training data
         X_concat=np.zeros([X.shape[0],0])
+        
         if 'l' in self.model_type:
             X_concat = np.concatenate((X_concat,X_regn), axis=1)
         if 'r' in self.model_type:
             if X_rules.shape[0] >0:
                 X_concat = np.concatenate((X_concat, X_rules), axis=1)
+            
+        if 'i' in self.model_type:
+            if X_instance.shape[0] >0:
+                X_concat = np.concatenate((X_concat, X_instance), axis=1)
+        return X_concat
+    def fit(self, X, y=None, feature_names=None):
+        """Fit and estimate linear combination of rule ensemble
 
-        ## initialise Lasso
-        if len(self.mt_feats)==0:
+        """
+        ## Enumerate features if feature names not provided
+        if feature_names is None:
+            self.feature_names = ['feature_' + str(x) for x in range(0, X.shape[1])]
+        else:
+            self.feature_names=feature_names
+        ## load rule ensemble
+        self.num_rules_peak_=0
+        if 'r' in self.model_type:
+            self.load_rule_candidates(X,y)
+            self.num_rules_peak_=len(self.rule_ensemble.rules)
+        ## Load Instance rules
+        if 'i' in self.model_type: 
+            self.load_instance_rule_candidates(X,y)
+ 
+        
+        # Solve Lasso
+        if self.mt_feat_mode=='specified' and len(self.mt_feats)==0:
+            X_concat=self.get_candidate_features(X)
             if self.rfmode=='regress':
                 self.lscv = LassoCV()
             else:
                 self.lscv=GLMCV(family='binomial')
         else:
-            rule_dirns=np.asarray([r.rule_direction for r in self.rule_ensemble.rules])
-            incr_feats_with_rules=np.asarray(np.hstack([self.incr_feats,self.n_feats+np.asarray([i_rule+1 for i_rule in np.arange(len(rule_dirns)) if rule_dirns[i_rule]>0])]))
-            decr_feats_with_rules=np.asarray(np.hstack([self.decr_feats,self.n_feats+np.asarray([i_rule+1 for i_rule in np.arange(len(rule_dirns)) if rule_dirns[i_rule]<0])]))
-            if self.rfmode=='regress':
-                self.lscv=GLMCV(family='gaussian',incr_feats=incr_feats_with_rules,decr_feats=decr_feats_with_rules)
-            else:
-                self.lscv=GLMCV(family='binomial',incr_feats=incr_feats_with_rules,decr_feats=decr_feats_with_rules)
-
+            if self.mt_feat_mode=='auto':
+                [self.incr_feats,self.decr_feats]=self.select_mono_feats(X,y)
+            if 'r' in self.model_type: 
+                [self.rule_ensemble,valid_rule_indxs]=self.get_mt_compliant_rule_ensemble(self.rule_ensemble,self.incr_feats,self.decr_feats)
+            X_concat=self.get_candidate_features(X)
+            [incr_feats_with_rules,decr_feats_with_rules]=self.get_candidate_feat_constraints(self.incr_feats,self.decr_feats)
+            self.lscv=GLMCV(family=self.glmnet_family,incr_feats=incr_feats_with_rules,decr_feats=decr_feats_with_rules)
+            
         ## fit Lasso
         self.lscv.fit(X_concat, y)
         
         return self
-
-    def predict(self, X):
+    def get_candidate_feat_constraints(self,incr_feats,decr_feats,override_rule_ensemble=None,override_model_type=None):
+        ## Compile feature coefficient constraints
+        incr_feats_with_rules=np.asarray([]) #np.hstack([self.incr_feats,self.n_feats+np.asarray([i_rule+1 for i_rule in np.arange(len(rule_dirns)) if rule_dirns[i_rule]>0])]))
+        decr_feats_with_rules=np.asarray([]) #np.hstack([self.decr_feats,self.n_feats+np.asarray([i_rule+1 for i_rule in np.arange(len(rule_dirns)) if rule_dirns[i_rule]<0])]))
+        n_feat_start=0
+        model_type=self.model_type if override_model_type is None else override_model_type
+        if 'l' in model_type:
+            incr_feats_with_rules=incr_feats
+            decr_feats_with_rules=decr_feats
+            n_feat_start=self.n_feats
+        if 'r' in model_type:
+            re=self.rule_ensemble if override_rule_ensemble is None else override_rule_ensemble
+            rule_dirns=np.asarray([r.rule_direction for r in re.rules])
+            incr_feats_with_rules=np.hstack([incr_feats_with_rules,n_feat_start+np.asarray([i_rule+1 for i_rule in np.arange(len(rule_dirns)) if rule_dirns[i_rule]>0])])
+            decr_feats_with_rules=np.hstack([decr_feats_with_rules,n_feat_start+np.asarray([i_rule+1 for i_rule in np.arange(len(rule_dirns)) if rule_dirns[i_rule]<0])])
+            n_feat_start=n_feat_start+len(re.rules)
+        if 'i' in model_type:
+            instance_dirns=np.asarray([r.dirn for r in self.instance_ensemble.get_all_learners()])
+            incr_feats_with_rules=np.hstack([incr_feats_with_rules,n_feat_start+np.asarray([i_rule+1 for i_rule in np.arange(len(instance_dirns)) if instance_dirns[i_rule]>0])])
+            decr_feats_with_rules=np.hstack([decr_feats_with_rules,n_feat_start+np.asarray([i_rule+1 for i_rule in np.arange(len(instance_dirns)) if instance_dirns[i_rule]<0])])
+            n_feat_start=n_feat_start+len(self.instance_ensemble.estimators)
+        
+        return [incr_feats_with_rules,decr_feats_with_rules]
+    def predict (self, X):
         """Predict outcome for X
 
         """
-        X_concat=np.zeros([X.shape[0],0])
-        if 'l' in self.model_type:
-            if self.lin_standardise:
-                X_concat = np.concatenate((X_concat,self.friedscale.scale(X)), axis=1)
-            else:
-                X_concat = np.concatenate((X_concat,X), axis=1)
-        if 'r' in self.model_type:
-            rule_coefs=self.lscv.coef_[self.n_feats:]
-            if len(rule_coefs)>0:
-                X_rules = self.rule_ensemble.transform(X,coefs=rule_coefs)
-                if X_rules.shape[0] >0:
-                    X_concat = np.concatenate((X_concat, X_rules), axis=1)
+
+        X_concat = self.get_candidate_features(X)#
         return self.lscv.predict(X_concat)
 
     def transform(self, X=None, y=None):
@@ -511,22 +585,102 @@ class RuleFit(BaseEstimator, TransformerMixin):
                data set (X)
         """
 
-        n_features= len(self.lscv.coef_) - len(self.rule_ensemble.rules)
-        rule_ensemble = list(self.rule_ensemble.rules)
+        n_features= self.n_feats#len(self.lscv.coef_) - len(self.rule_ensemble.rules)
+        
         output_rules = []
-        ## Add coefficients for linear effects
-        for i in range(0, n_features):
-            if self.lin_standardise:
-                coef=self.lscv.coef_[i ]*self.friedscale.scale_multipliers[i]
-            else:
-                coef=self.lscv.coef_[i ]
-            output_rules += [(self.feature_names[i], 'linear',coef, 1)]
+        n_up_to=0
+        if 'l' in self.model_type:
+            ## Add coefficients for linear effects
+            for i in range(0, n_features):
+                if self.lin_standardise:
+                    coef=self.lscv.coef_[i ]*self.friedscale.scale_multipliers[i]
+                else:
+                    coef=self.lscv.coef_[i ]
+                output_rules += [(self.feature_names[i], 'linear',coef, 1,0)]
+            n_up_to=n_up_to+n_features
         ## Add rules
-        for i in range(0, len(self.rule_ensemble.rules)):
-            rule = rule_ensemble[i]
-            coef=self.lscv.coef_[i + n_features]
-            output_rules += [(rule.__str__(), 'rule', coef,  rule.support,rule.rule_direction)]
+        if 'r' in self.model_type:
+            rule_ensemble = list(self.rule_ensemble.rules)
+            for i in range(0, len(self.rule_ensemble.rules)):
+                rule = rule_ensemble[i]
+                coef=self.lscv.coef_[i + n_up_to]
+                output_rules += [(rule.__str__(), 'rule', coef,  rule.support,rule.rule_direction)]
+            n_up_to=n_up_to+len(rule_ensemble)
+        ## Add rules
+        if 'i' in self.model_type:
+            instance_ensemble = list(self.instance_ensemble.get_all_learners())
+            for i in range(0, len(instance_ensemble)):
+                rule = instance_ensemble[i]
+                coef=self.lscv.coef_[i + n_up_to]
+                output_rules += [(rule.__str__(), 'instance', coef,  99,rule.dirn)]
         rules = pd.DataFrame(output_rules, columns=["rule", "type","coef", "support","dirn"])
         if exclude_zero_coef:
             rules = rules.ix[rules.coef != 0]
         return rules
+
+    def select_mono_feats(self,X_train,y_train):
+        loss_fn=rmse if self.rfmode=='regress' else binom_dev
+        X_rules_all = self.rule_ensemble.transform(X_train) # transform all rules once here, then filter appropriate columns below
+        X_regn=self.get_lin_feats(X_train)
+        last_overall_best=[1e9+1,[],[]]
+        overall_best=[1e9,[],[]]
+        while overall_best[0]<last_overall_best[0]:
+            test_best=overall_best.copy()
+            feats=np.arange(X_train.shape[1]+1) if len(overall_best[1])==0 and len(overall_best[2])==0 else np.arange(X_train.shape[1])+1
+            for feat in feats:
+                if feat not in overall_best[1] +overall_best[2]: 
+                    feat_losses=[0,0]
+                    for dirn in [0] if feat==0 else [-1,+1]:
+                        if feat==0: # include the no MT feature case
+                            incr_feats_test=[]
+                            decr_feats_test=[]
+                        else:
+                            incr_feats_test=overall_best[1]+([feat] if dirn==1 else [])
+                            decr_feats_test=overall_best[2]+([feat] if dirn==-1 else [])
+                        [rule_ensemble,valid_rule_indxs]=self.get_mt_compliant_rule_ensemble(self.rule_ensemble,incr_feats_test,decr_feats_test)
+                        X_rules = X_rules_all[:,valid_rule_indxs]
+                        X_concat = np.concatenate((X_regn, X_rules), axis=1)
+                        [incr_feats_with_rules,decr_feats_with_rules]=self.get_candidate_feat_constraints(incr_feats_test,decr_feats_test,override_rule_ensemble=rule_ensemble,override_model_type='rl')
+                        #print(str(incr_feats_test) + ' ' + str(decr_feats_test) + ' ' + str(len(valid_rule_indxs)) +' ' + str(len(incr_feats_with_rules)+len(decr_feats_with_rules)))
+                        # estimate performance in CV loop
+                        kf = StratifiedKFold(n_folds=self.auto_mt_feat_cv,y=y_train,shuffle=False)
+                        pred_y_proba=np.zeros(len(y_train))
+                        for train_index, test_index in kf: #kf.split(X_train, y_train):
+                            X_train_cv, X_test_cv = X_concat[train_index,:], X_concat[test_index,:]
+                            y_train_cv, y_test_cv = y_train[train_index], y_train[test_index]
+                            lscv_cv=GLMCV(family=self.glmnet_family,incr_feats=incr_feats_with_rules,decr_feats=decr_feats_with_rules)
+                            lscv_cv.fit(X_train_cv, y_train_cv)
+                            pred_y_proba[test_index]=lscv_cv.predict_proba(X_test_cv)
+                        loss=loss_fn(y_train,pred_y_proba)
+                        feat_losses[0 if dirn==-1 else 1]=loss
+                        print(str(incr_feats_test) + ' ' + str(decr_feats_test) + ': ' + str(loss))
+                        if dirn==0: # baseline, no mt feats
+                            overall_best[0]=loss
+                        if self.auto_mt_feat_type=='best' or dirn==0:
+                            if loss<test_best[0]:
+                                test_best=[loss,incr_feats_test,decr_feats_test]
+                        elif self.auto_mt_feat_type=='best_diff':
+                            if dirn==1:
+                                best=np.argmin(feat_losses)
+                                worst=np.argmax(feat_losses)
+                                if feat_losses[best]<test_best[0] and feat_losses[worst]>=overall_best[0] :
+                                    test_best=[feat_losses[best],overall_best[1]+([feat] if best==1 else []),overall_best[2]+([feat] if best==0 else [])]
+                            
+            # if best is an improvement, add to appropriate direction, else stop
+            last_overall_best=overall_best.copy()
+            if test_best[0]<overall_best[0]:
+                overall_best=test_best.copy()
+                print('    UPDATE: ' + str(test_best))
+                if len(overall_best[1])==0 and len(overall_best[2])==0: # this means that no MT feats was the best option after considering all!
+                    break
+                                
+        # return optimal features
+        incr_feats=overall_best[1]
+        decr_feats=overall_best[2]
+        return [incr_feats,decr_feats]
+        
+def binom_dev(y_true,y_pred):
+    return np.sum(np.log(1+np.exp(-2*y_true*y_pred)))
+    
+def rmse(y_true,y_pred):
+    return -np.sqrt(np.sum((y_true-y_pred)**2))

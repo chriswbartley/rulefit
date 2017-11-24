@@ -13,7 +13,7 @@ features = X.columns
 X = X.as_matrix()
 
 typ='classifier' #classifier or regressor
-use_mt_feats=False
+use_mt_feats=True
 
 if use_mt_feats:
     incr_feats=[6,9]
@@ -36,10 +36,11 @@ elif typ=='classifier':
     y_class[y_class>=21]=+1
     N=X.shape[0]
     rf = RuleFit(tree_size=4,sample_fract='default',max_rules=2000,
-                 memory_par=0.01,
+                 memory_par=0.01,model_type='rl',
                  tree_generator=None,n_feats=X.shape[1],incr_feats=incr_feats,decr_feats=decr_feats,
                 rfmode='classify',lin_trim_quantile=0.025,
-                lin_standardise=True, exp_rand_tree_size=True,random_state=1) 
+                lin_standardise=True, exp_rand_tree_size=True,random_state=1,
+                mt_feat_mode='auto',auto_mt_feat_type='best_diff',auto_mt_feat_cv=3) 
     rf.fit(X, y_class, feature_names=features)
     
 res1=rf.predict(X)
