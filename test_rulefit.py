@@ -34,14 +34,14 @@ def test_rule_condition_greater():
 
 
 ## Testing rule
-rule = Rule([rule_condition_smaller, rule_condition_greater])
+rule = Rule([rule_condition_smaller, rule_condition_greater],1)
 
 def test_rule_transform():
     np.testing.assert_array_equal(rule.transform(X),
                                   np.array([0,1,0]))
 
 def test_rule_equality():
-    rule2 = Rule([rule_condition_greater, rule_condition_smaller])
+    rule2 = Rule([rule_condition_greater, rule_condition_smaller],1)
     assert rule == rule2
 
 
