@@ -1,5 +1,5 @@
 # RuleFit
-Implementation of a rule based prediction algorithm based on [the rulefit algorithm from Friedman and Popescu (PDF)](http://statweb.stanford.edu/~jhf/ftp/RuleFit.pdf)
+Implementation of a rule based prediction algorithm based on [the rulefit algorithm from Friedman and Popescu (PDF)](http://statweb.stanford.edu/~jhf/ftp/RuleFit.pdf). This implementation includes the ability to specify *monotone* features as described in Bartley C., Liu W., Reynolds M., 2017, *A Novel Framework for Partially Monotone Rule Ensembles.* ICDE submission, prepub, available [here](http://staffhome.ecm.uwa.edu.au/~19514733/).
 
 The algorithm can be used for predicting an output vector y given an input matrix X. In the first
 step a tree ensemble is generated with gradient boosting. The trees are then used to form
@@ -9,7 +9,10 @@ in the splits. The ensemble of rules together with the original input features a
  in a L1-regularized linear model, also called Lasso, which estimates the effects of each rule on
 the output target but at the same time estimating many of those effects to zero.
 
-You can use rulefit for predicting a numeric response (categorial not yet implemented).
+If monotone features are specified, the candidate rules (from boosting) are filtered prior to regression to remove rules that are not monotone compliant (i.e. do not comform to Theorem 3.1 and Lemma 4.1 of Bartley et al. above). Also the coefficients of the regression are sign constrained as appropriate to ensure monotonicity. See original paper for more details.
+
+You can use rulefit for predicting a numeric response.
+
 The input has to be a numpy matrix with only numeric values.
 
 ## Installation
