@@ -39,7 +39,7 @@ features = X.columns
 X = X.as_matrix()
 
 rf = RuleFit()
-rf.fit(X, y, feature_names=X.columns)
+rf.fit(X, y, feature_names=features)
 
 ```
 
@@ -67,7 +67,7 @@ rf.predict(X)
 ```python
 rules = rf.get_rules()
 
-rules = rules[rules.coef != 0].sort("support")
+rules = rules[rules.coef != 0].sort_values("support", ascending=False)
 
 print rules
 ```
@@ -79,6 +79,11 @@ print rules
 
 ## Changelog
 All notable changes to this project will be documented here.
+
+### [v0.2] - 2017-11-24
+- Introduces classification for RuleFit
+- Adds scaling of variables (Friedscale)
+- Allows random size trees for creating rules
 
 ### [v0.1] - 2016-06-18
 - Start changelog and versions
